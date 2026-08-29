@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+captures/
+logs/
+data/save.json
+data/*.tmp
+_decompile/
+_decompile2/
+*.bin
+.DS_Store
+Thumbs.db
