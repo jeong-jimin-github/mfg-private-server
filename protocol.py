@@ -4,13 +4,30 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
 
 from kbinxml import KBinXML
 from kbinxml.kbinxml import KBinXML as _KBinXMLClass
 
 
 _LATIN_ENCODINGS = {"iso-8859-1", "latin-1", "latin1", "iso8859-1", "cp1252"}
+
+
+@dataclass(frozen=True)
+class EamuseDecodeMeta:
+    """Transport details needed to mirror an AVS request in the response."""
+
+    used_kbin: bool
+    kbin_encoding: Optional[str] = None
+    kbin_compressed: Optional[bool] = None
+    decrypted_body: bytes = b""
+    decoded_body: bytes = b""
+
+    def __bool__(self) -> bool:
+        """Keep legacy callers that treated decode metadata as a bool working."""
+        return self.used_kbin
+
 
 
 def _looks_binary_bytes(data: bytes) -> bool:
@@ -170,52 +187,86 @@ def lz77_compress_store(data: bytes) -> bytes:
 
 def decode_eamuse_body(
     body: bytes, eamuse_info: Optional[str], compress: Optional[str]
-) -> Tuple[str, bool]:
-    """Return (xml_text, used_kbin)."""
-    data = decrypt(body, eamuse_info)
-    blobs = [data]
+) -> Tuple[str, EamuseDecodeMeta]:
+    """Return decoded XML and the exact packet properties AVS used.
+
+    Mirroring the request binary-XML encoding matters for newer XRPC bridges.
+    kbinxml defaults to CP932 when encoding, even when the peer sent UTF-8.
+    """
+    decrypted = decrypt(body, eamuse_info)
+    blobs: list[bytes] = []
     if (compress or "").lower() == "lz77":
         try:
-            blobs.insert(0, lz77_decompress(data))
+            blobs.append(lz77_decompress(decrypted))
         except Exception:
-            pass
+            blobs.append(decrypted)
     else:
-        try:
-            unpacked = lz77_decompress(data)
-            if unpacked and unpacked != data:
-                blobs.append(unpacked)
-        except Exception:
-            pass
+        blobs.append(decrypted)
+
     last_err: Optional[Exception] = None
-    parsed: list[tuple[str, bool]] = []
+    parsed: list[tuple[str, EamuseDecodeMeta]] = []
     hex_card = re.compile(r'cardid="[0-9A-Fa-f]{16}"')
     for blob in blobs:
         if blob.startswith(b"<?xml") or blob.startswith(b"<"):
-            return blob.decode("utf-8", errors="replace"), False
+            return (
+                blob.decode("utf-8", errors="replace"),
+                EamuseDecodeMeta(
+                    used_kbin=False,
+                    decrypted_body=decrypted,
+                    decoded_body=blob,
+                ),
+            )
         try:
             if not KBinXML.is_binary_xml(blob):
                 continue
             kbin = KBinXML(blob, convert_illegal_things=True)
-            parsed.append((kbin.to_text(), True))
+            parsed.append(
+                (
+                    kbin.to_text(),
+                    EamuseDecodeMeta(
+                        used_kbin=True,
+                        kbin_encoding=getattr(kbin, "encoding", None),
+                        kbin_compressed=getattr(kbin, "compressed", None),
+                        decrypted_body=decrypted,
+                        decoded_body=blob,
+                    ),
+                )
+            )
         except Exception as exc:
             last_err = exc
             continue
-    for text, used in parsed:
+
+    # Keep the previous heuristic for old malformed card captures, but preserve
+    # the transport metadata belonging to the selected candidate.
+    for text, meta in parsed:
         if hex_card.search(text):
-            return text, used
+            return text, meta
     if parsed:
         return parsed[0]
     if last_err:
         raise last_err
     raise ValueError("e-amuse body is not XML or kbinxml")
 
-
 def encode_eamuse_body(
-    xml_text: str, eamuse_info: Optional[str], compress: Optional[str], use_kbin: bool
+    xml_text: str,
+    eamuse_info: Optional[str],
+    compress: Optional[str],
+    meta: Union[EamuseDecodeMeta, bool],
 ) -> bytes:
-    if use_kbin:
+    """Encode a response using the same binary-XML flavor as the request."""
+    # v0.1 exposed a boolean ``use_kbin`` argument. Accept it during the
+    # transition so scripts and downstream integrations do not break while the
+    # server itself passes the richer transport metadata.
+    if isinstance(meta, bool):
+        meta = EamuseDecodeMeta(used_kbin=meta)
+    if meta.used_kbin:
         raw = xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text
-        payload = KBinXML(raw).to_binary()
+        kbin = KBinXML(raw)
+        # Do not silently fall back to kbinxml's CP932 default. Newer AVS/KAMUNITY
+        # requests can use UTF-8 and expect the response packet to mirror it.
+        encoding = meta.kbin_encoding or "UTF-8"
+        internal_compressed = True if meta.kbin_compressed is None else meta.kbin_compressed
+        payload = kbin.to_binary(encoding=encoding, compressed=internal_compressed)
     else:
         payload = xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text
     if (compress or "").lower() == "lz77":

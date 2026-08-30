@@ -4,10 +4,13 @@ __pycache__/
 .pytest_cache/
 captures/
 logs/
+crashdumps/
 data/save.json
+data/save.json.bak*
 data/*.tmp
 _decompile/
 _decompile2/
+verification/
 *.bin
 .DS_Store
 Thumbs.db

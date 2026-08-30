@@ -1,6 +1,11 @@
 # cardmng / e-Amuse card login blocker
 
-Guest 2P/4P play works. Card tag currently crashes Unity or hangs the XRPC.
+> **STATUS 2026-08-30: RESOLVED.** `tools/patch_cardmng_module.py` renames the
+> managed XRPC module to `vfgcard`, AVS stops hijacking it, and card login
+> completes end to end (see `notes/progress.md` and `log.txt` 14:34).
+> Everything below is the history of how the root cause was found.
+
+Guest 2P/4P play works. The historical card-tag crash described below was fixed by the managed-module rename.
 
 Do not probe KONAMI. Localhost only.
 
@@ -94,3 +99,57 @@ Spice card override writes 8-byte IDm into kbinxml **string** attributes. Decode
 - Make `getrefid` finish (`thread: exit`) then follow `inquire(newflag=1)` → `authpass` → `bindmodel` → `vfgac.update_refer` → AOG `/login`
 - Do not return `binded="1"` until `bindmodel` has run **and** the inquire request cardid is 16-hex ASCII
 - Do not add `pcode`/`useridflag`/`lastupdate` unless a clean capture shows them
+
+## 2026-08-30 (Claude session) — confirmed root cause
+
+Decoded the raw kbin captures byte by byte
+(`captures/transport/0021_cardmng_inquire.bin`, `0024/0051_cardmng_getrefid.bin`).
+The data section is well formed, so the decoder is *not* at fault:
+
+| attr | wire bytes | note |
+|---|---|---|
+| `cardid` | `F0 DC DE 00` | 3 bytes; CP932-decodes to `ﾞ` |
+| `cardtype` | `"2038653344"` | different 32-bit garbage every request |
+| `method` | `"getrefid"` | correct |
+| `model` | `98 25 1D 06 00` | game passes `model=null`, AVS adds garbage |
+| `newflag` | `"1"` | correct |
+| `passwd` | `"<car"` | first 4 bytes of the request XML buffer |
+
+Managed side is clean: `Bi2xInputVFG.ICCardReader_Update()` builds
+`CardIDStrings` as 16 upper-hex chars from `_ePassData[2..9]`, and
+`XrpcUtil.CreatetXmlText()` hands AVS a correct XML string.
+`W:xrpc: module_add: cardmng: already has same name` shows the game's
+`Ea3XrpcAddModule("cardmng", ...)` is rejected because AVS already owns the
+module, so AVS regenerates the request from its own (uninitialised) card
+session. **The corrupted request cannot be fixed from the server.**
+
+### Crash signature
+
+`Application Error`: `spice64.exe` faulting module `ntdll.dll`,
+`0xc0000005` at offset `0x5346d` (heap manager), ~1 s after
+`cardmng.getrefid` returns `fin=1`. That is heap corruption inside AVS, not a
+managed NRE — it fires whatever the response contains:
+
+- `getrefid` -> `refid`/`dataid` (bemaniutils shape): crash (13:06, 13:55)
+- `getrefid` -> `status="110"`: crash (13:14)
+- `inquire`  -> `status="112"` only: never crashes
+
+Every cardmng response except a bare `status="112"` has killed the process, so
+response tuning alone is unlikely to solve this.
+
+### Server state after this session
+
+- `VFG_CARDMNG_MODE=compat` (default): malformed cardids normalize onto
+  `DEFAULT_CARDID` and `getrefid` answers `refid`/`dataid` like bemaniutils.
+  `strict` restores the old 112/110 quarantine.
+- `VFG_CARDMNG_INQUIRE_MODE=auto` (default) / `new` (always 112).
+- The typed PIN never reaches the server (`passwd="<car"`), so `authpass`
+  accepts any PIN by design.
+
+### Client-side levers still untried
+
+- `spice64.exe -automap` (enabled 13:58): auto-creates missing AVS property
+  nodes and dumps every property to `automap_0.xml`.
+- Unity logging: `MFGClient_Data/boot.config` had `nolog=`; removed
+  (`boot.config.bak` keeps the original). Unity writes to
+  `dev/raw/log/output_log.txt` (`-logFile` is set by spice).

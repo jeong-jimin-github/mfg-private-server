@@ -1,27 +1,237 @@
 # Progress
 
-## 2026-08-29
+## 2026-08-30 — feature build-out
 
-### Last known working state
-- Client previously failed before network check: `unresolve 'eamuse.konami.fun'`.
-- Build: `VFG:J:A:A:2025122300`
-- Server: local Python e-Amuse + AOG HTTP on `127.0.0.1:8080`
+### What changed
 
-### Newly observed RPCs
-- CONFIRMED XRPC modules `vfgac` / `vfglog` via `Ea3XrpcAddModule("vfgac","local",...)`.
-- CONFIRMED HTTP game API paths from `MFG.GameRequest.*` (`/appli_boot`, `/login`, `/get_menudata`, ...).
-- CONFIRMED XML status node `serv_st/code` (0 = OK). Missing node defaults to 630.
+New modules:
 
-### Implemented
-- Transport: RC4 + LZ77 store + kbinxml
-- Common e-Amuse bootstrap
-- VFG XRPC stubs including `service_list`
-- AOG HTTP stubs + profile JSON store
-- Spice ea3-config pointed at localhost HTTP
+- `mahjong.py` — tile maths: per-suit memoised shanten (standard / chiitoi /
+  kokushi), waits, ukeire, hand decomposition, yaku bits matching
+  `MFG.Types.Yaku`, fu counting, `MahjongUtility.GetScore`-compatible payments.
+- `taikyoku.py` — the table state machine: wall building per table type, turn
+  order, melds, riichi/furiten/ippatsu bookkeeping, the CPU AI, and the
+  `cell_data_N` stream.
 
-### Current blocker
-- Title/menu reached. Attract screen asks for coin or e-Amusement card (expected).
-- Full CPU match still needs ReceiveCommand tile stream (`TaikyokuData.cell_info`).
+`server.py`:
 
-### Next action
-- Start server, launch Spice2x, capture the real request sequence, fill any missing fields.
+- `/appli_info` now returns the base64 `events` blob, so `GameEventType` flags are
+  actually on (spirit-gym bonus, every event-table flag, sticker decoration,
+  character appearances, odekake, premium start, private match…).
+- `/get_menudata` advertises all 23 `GAME_MODE`s with the right seat count and
+  starting score, plus `battle_item_settings`.
+- Spirit gym, gacha, reach-song gacha, sticker chat, jongstone, mg, end_show,
+  present_done and the item logs are real handlers instead of `xml_response()`.
+- `eacoin` (PASELI) is a working local wallet.
+- The match handlers drive `taikyoku.Table` instead of the old tsumogiri stub.
+
+### The CPU used to never riichi / ron / tsumo
+
+The old `/gget` `/gpost` code drew a tile for each CPU seat and immediately
+discarded the same tile. It never evaluated a hand, so no riichi, ron, tsumo,
+call, ryuukyoku or second kyoku could ever happen, and every "match" was a single
+hand that ended when the human won. That whole path is gone.
+
+### Verified
+
+- `test_engine.py` — 160 games (40 each of nima/sanma/tonpu/hanchan) with no
+  crashes or stalls; every cell parses as XML. All of TSUMOAGARI, RON, RYUKYOKU,
+  PON, CHI, ANKAN, MINKAN, KAKAN and riichi (SCORERANK) appear.
+- `test_match_e2e.py` — drives whole matches through the real HTTP handlers for
+  7 game modes and asserts the client-visible contract (mwait, cell_sno ordering,
+  KYOKUEND end_stat, mgresult players), plus the events/gacha/dojo/sticker
+  responses.
+- `test_integration.py`, `test_cardmng.py`, `test_protocol.py` still pass.
+
+### Card login is no longer the blocker
+
+`notes/cardmng-blocker.md` is stale. `tools/patch_cardmng_module.py` renames the
+managed XRPC module to `vfgcard` so AVS stops regenerating the request from its
+own uninitialised card session; `log.txt` from 2026-08-30 14:34 shows
+`vfgcard.inquire` → `vfgac.update_refer` → `vfgcard.authpass` all completing with
+no crash, followed by the full non-guest boot sequence (`gacha_info`,
+`mission_date`, per-kind `client_state_read`, `dojo_get_status`).
+
+That last session is also exactly why the user saw the spirit gym fail:
+`DojoFlow.Slot_Init` indexes `m_statusResult.SlotInfos[i]` for four slots, and the
+old server answered `/dojo_get_status` with nothing.
+
+### Still client-gated (cannot be fixed from the server)
+
+- Gacha button needs `!GameUtility.IsFreePlay()` → turn freeplay off in
+  `dev/nvram/coin.xml`.
+- Gacha / spirit gym / missions / notices / presents / chara select / sticker
+  button are all hard-disabled while `Account.IsGuestUser` is true → card login.
+- Event tables need a card too; guests only get the constancy variants
+  (`IsConstancyTakuAvailable` has no guest check), which the server enables.
+
+### Gacha select crash (2026-08-30 18:57 session)
+
+`log.txt` ends on `/aog/gacha_info` at 18:57:06 with no further request and no
+managed exception: the client took the gacha mode-select window, entered
+`GachaSelectFlow`, re-fetched `gacha_info` and died there.
+
+Cause was on our side. `_gacha_info_xml()` advertised all 27 series with empty
+`<items>`, `<pickup_charas>` and `<custom_pickup_items>`, and
+`GachaSelectBgMovie` cannot survive that. For a Pickup banner whose `PickupKind`
+is not `NewGirl`, `GetGachaSelectMovies()` returns `["CutinPlay"]` when there are
+no pickup characters, so `Play()` calls `PlayCutIn(GetSpecialPickupItem())` -
+also empty because that is derived from the pickup characters - which falls
+straight into `BgMovie_Change()`, which wraps back to index 0, reads
+`"CutinPlay"` and calls `PlayCutIn` again. Neither hop awaits, so it is plain
+synchronous recursion until the stack dies. Pickup-mode sorting puts
+`PickupLillyIppatsu` (140, `PickupKind.Lilly`) first, so the crash was immediate.
+
+The same emptiness would have thrown `KeyNotFoundException` out of
+`GenerateGachaItemID` on the first pull - the client draws locally and indexes
+the except-pickup pool by rolled rarity.
+
+Fix: `data/gacha_pools.json` (generated by `tools/extract_gacha_pools.py` from
+`CutinItemMaster`, `GachaSeriesServerInfo`, `ItemIDExtentions` and the
+Addressables catalog) now feeds real pools, pickup characters and reach-song
+lists into `/gacha_info`; `test_gacha_pools.py` asserts both invariants for every
+advertised banner, curated and `VFG_GACHA_ALL`. The catalog also settled the
+CharaType names, which showed the reach-song table had MusicYao (Chara05) and
+MusicTenshi (Chara04) swapped - `music_gacha_play` was handing out the wrong
+character's songs.
+
+### 対局 / イベント対局 did nothing (2026-08-30 19:34 session)
+
+Symptom: on the Home screen both 対局 and イベント対局 were dead - no sound, no
+window, and nothing at all in `logs/server.log`. Gacha, spirit gym, missions and
+the dojo all worked in the same session, so the click subscriptions in
+`OnInitializeAfterIntroduction` had all been registered.
+
+`log.txt` and `logs/server.log` place the regression between 14:35 (a full CPU
+match started from the client: `entry_game` with the client's own parameter set,
+then ~2 minutes of gget/gpost/gchat) and the 18:04 feature build-out, which is
+when `/appli_info` started returning the `events` blob. Every boot since then
+reaches `get_menudata` and never reaches `entry_game`.
+
+Cause: `HomeEventSelectWindow.ModePanel_Create` writes each banner into
+`_modePanelInstanceParents[index]`, a fixed list of parent slots in the Home
+scene. The normal window always builds exactly three panels, so there are three
+slots. `ACTIVE_EVENTS` turned on every `EventTakuMaster.CurrentFlagType`, and
+because `EnableTakuType[1]` doubles a table into tonpu + sanma banners that came
+to twelve panels for a card-logged-in player - the fourth one runs off the list.
+The exception escapes `OnEventTaikyokuButton()` (`async void`) after it has set
+`_taikyokuModeSelectStatus = SelectingEvent`, and only the window's close button
+resets that field, so the plain 対局 button returns at its first `if` from then
+on too.
+
+Note the three Competition flags are not part of the twelve:
+`BaseEventGameData.IsAvailable()` returns false when
+`CurrentFlagType == CompetitionFlagType`, and `CompetitionTakuAvailables()`
+needs an in-progress competition the server never sends, so `Competition6/7/8`
+only *hide* AccelDora / Mentanpin / FireGalaxy.
+
+Fix: `server.py` splits the flag list into `BASE_EVENTS` (features - spirit gym
+bonus, stickers, character appearances, QoL) and `EVENT_TAKU_SETS`, selected by
+`VFG_EVENT_TAKU` (`min` default / `off` / `all`). `EVENT_TAKU_PANELS` records
+what each flag costs in banners, `main()` logs the budget at startup, and
+`test_match_e2e.test_event_taku_panel_budget` asserts every set except the
+deliberately-bad `all` fits in `EVENT_TAKU_PANEL_SLOTS = 3`.
+
+Not verified in-game yet - the client has to be restarted, because
+`_taikyokuModeSelectStatus` only clears on a new scene load.
+
+### Next
+
+- Capture a real session with the new server and diff `captures/` for any node the
+  client still logs as missing.
+- `/reconnect` uses a path-shaped URL (`.../reconnect/<ver>/<session>/<webid>/`)
+  that `game_api_name()` does not route yet.
+
+### Full client decompile, and where the PIN crash actually is (2026-08-30 20:xx)
+
+`../unity-project/` now holds the whole managed client, not the ~60 files that
+were cherry-picked into `_decompile/` and `_decompile2/`: **1829 .cs files**
+across `Assembly-CSharp` (1299), `Assembly-CSharp-firstpass`, `kamunity`,
+`zxing.unity`, `Springbone.Runtime`, `Unity_userfully`, `Shirahama*`,
+`VirtualSurround`, `Win10actLog-Runtime`. This is a Mono build, so it is real
+source, not stubs. `unity-project/tools/decompile.sh` regenerates it.
+
+Assets are not extracted (that needs AssetRipper), but `catalog.json` is plain
+JSON and greppable, which is enough to check any asset path the server implies.
+
+#### The 19:57-19:59 session did not fail at the card or the PIN
+
+`captures/` from that run says the whole card-entry sequence completed:
+
+    vfgcard.inquire -> vfgac.update_refer -> vfgcard.authpass (PIN accepted)
+    appli_info, login, get_menudata, client_state_read(one_kind=version_game),
+    mission_date, gacha_info, client_state_read, player_record
+
+which is exactly `GameDataManager.ExecLoadAtCardEntry()` in order, start to
+finish. Every one returned 200 with a well-formed body. The client also never
+reported a failure: `RequestApiBase.PushRequest` reserves a
+`("network_error", "<JST>,<RequestType>,<StatusCode>,...")` entry for any request
+that throws and flushes it through `vfglog.put_msg`, and the only put_msg in that
+run carried `activation_info` / `storage_info`, i.e. the boot report.
+
+The last request of the whole session is `/dojo_get_status`. That one is fired by
+`HomeFlow.OnInitializeBeforeIntroduction` as
+`IsNewDispReflesh(isFirstReflesh: true, ...).Forget()` - fire-and-forget, roughly
+40% into Home init - and everything after it in Home init (`EventWindowInit`,
+`EvnetWindowButtonInit`, `HomeCarouselBannerInit`, `PresentBox.AutoAssignment`,
+`m_charaManager.Load`) touches no server at all.
+
+So the client got past login, built most of the Home scene, and died there. AVS
+logged no shutdown, so it was an abrupt process death - the same shape as the
+gacha `GachaSelectBgMovie` stack overflow, not a managed exception.
+
+#### The server side of it is clean, and that is now checked mechanically
+
+`tools/check_parser_contract.py --live` calls every `GAME_HANDLERS` entry and
+compares the response against what the matching `MFG.GameRequest/*.cs` `OnParse`
+dereferences unconditionally (`MustNeedElement`, `.Element(x).Value*`,
+`.Attribute(x).Value`) - the exact defect class as the `battle_item_settings`
+fix. **41 parsers, 41 routed, 0 missing required nodes.**
+
+Also checked by hand against the decompile and found *not* to be the cause:
+
+- `player_game` state is well-formed - `CharaData` has 19 entries and
+  `m_dojoSlotUnlocked` has 4, so `GetCurrentChara()` (`CharaData[(int)SelectChara]`,
+  SelectChara=0=Chara01) and `IsNonSetSlotExist()` cannot index out of range.
+- `HomeFlow.IsNewDispReflesh` wraps the whole dojo block in `try/catch`, so
+  nothing in the dojo response can escape it.
+- `HomeEventSelectWindow.ModePanel_Create` (the `_modePanelInstanceParents`
+  overflow) runs from `Open()`, i.e. only on a button press, not during init.
+- Every prefab `EventWindowInit` loads for the enabled tables is present in the
+  Addressables catalog (`FireReach/Prefabs/FireReachHome2.prefab`,
+  `Comeback/Prefabs/HomeWindow.prefab`, `Kirisame/Prefabs/HomeWindow.prefab`,
+  plus the ImportantNotice / Bingo / TenshiGowan / Yell windows).
+
+#### Why we are still guessing, and what changed to stop that
+
+There is no client-side log at all in this build:
+
+- `%LOCALAPPDATA%Low\DefaultCompany\MFGClient\` is empty even though `nolog=`
+  was removed from `game\MFGClient_Data\boot.config` on 08-30 13:53.
+- `KAMUNITY.Logger.Log` forwards to `Avs.AvsLogMisc("UNITY", ...)`, which should
+  surface in spice's `log.txt` as `M:UNITY:` lines. `grep -c UNITY log.txt` is
+  **0**, so that path is dead too - and `RequestApiBase.PushRequest` logs every
+  single request through it, so it is not for lack of calls.
+
+Three changes so the next crash leaves evidence:
+
+1. `handle_vfglog` no longer throws `put_msg` away. `network_error` entries log
+   at ERROR and name the failing `MFG.GameRequest` class; everything else logs at
+   INFO. Covered by `test_integration.check_client_log_channel`.
+2. Captures go to `captures/run-<timestamp>/` with `captures/latest.txt` pointing
+   at the newest. `_seq` restarted at zero every launch, so each restart
+   overwrote the previous session's dumps from 0001 up - the run that just
+   crashed was routinely destroyed by the restart that came after it. Old mixed
+   dumps were moved to `captures/run-legacy/`.
+3. `start.bat debug` adds Unity's `-logFile` to the game launch
+   (`unity_player.log`, previous run rotated to `.prev`). Plain `start.bat` is
+   unchanged. If spice64 rejects the extra argument, that is the answer - use
+   plain `start.bat` and say so.
+
+#### Next
+
+- Run `start.bat debug`, reproduce, then read `unity_player.log` and
+  `logs/server.log` (grep `[client] network_error`). A stack overflow will show
+  as a truncated log with no exception; a managed fault will name the type.
+- If `-logFile` does nothing, the remaining lever is the `usePlayerLog` flag
+  baked into `globalgamemanagers`, which needs a Unity serialized-asset editor.
